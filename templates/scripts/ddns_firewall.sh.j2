@@ -1,7 +1,7 @@
 #!/bin/bash
 # ----------------------------------------
 # Firewall based on DDNS
-# Ver 1.3 Update 2025/08/04
+# Ver 1.4 Update 2026/11/06
 # Author Annda
 # ----------------------------------------
 
@@ -11,6 +11,9 @@
 domains='{{ v_script_ddns_firewall_domain|default("www.annda.net/karina.ns.cloudflare.com") }}'
 trust_ips='{{ v_script_ddns_firewall_trust_ips|default("1.1.1.1") }}'
 ports='{{ v_script_ddns_firewall_ports|default("22") }}'
+# Automatically add /etc/ssh/sshd_config.d/70-ddns-firewall.conf based on ddns parsing results, 0: disable, 1: enable
+trust_ssh_support={{ v_script_ddns_firewall_trust_ssh_support|default(0) }}
+sshd_conf='/etc/ssh/sshd_config.d/70-ddns-firewall.conf'
 
 # print log to /var/log/message, 0: disable, 1: enable
 debug='{{ v_script_ddns_firewall_debug|default(0) }}'
@@ -23,8 +26,10 @@ trap 'clean_ddns_firewall' INT
 trap 'clean_ddns_firewall' TERM
 
 function update_ddns_firewall {
+    ddns_ips=''
     /usr/sbin/iptables -t nat -F ddns_firewall
     /usr/sbin/iptables -t nat -A ddns_firewall -s 10.0.0.0/8 -j RETURN
+    /usr/sbin/iptables -t nat -A ddns_firewall -s 100.104.0.0/16 -j RETURN
     /usr/sbin/iptables -t nat -A ddns_firewall -s 172.16.0.0/12 -j RETURN
     /usr/sbin/iptables -t nat -A ddns_firewall -s 192.168.0.0/16 -j RETURN
     /usr/sbin/iptables -t nat -A ddns_firewall -s ${external_ip}/32 -j RETURN
@@ -35,11 +40,32 @@ function update_ddns_firewall {
         ddns_ip=`dig @${domain##*/} +short ${domain%%/*} | head -n1 | grep -Po '([0-9]{1,3}\.){3}[0-9]{1,3}'`
         if [ ! -z $ddns_ip ]; then
             /usr/sbin/iptables -t nat -A ddns_firewall -s ${ddns_ip}/32 -j RETURN
+            ddns_ips="${ddns_ips},${ddns_ip}"
         fi
     done
     [ $debug -eq 1 ] && /usr/sbin/iptables -t nat -A ddns_firewall -p tcp -m multiport --dports ${debug_exclude_ports} -j RETURN
     [ $debug -eq 1 ] && /usr/sbin/iptables -t nat -A ddns_firewall -j LOG --log-prefix='[ddns-firewall-prerouting] '
     /usr/sbin/iptables -t nat -A ddns_firewall -p tcp -m multiport --dports $ports -j MARK --set-mark 2
+    [ $trust_ssh_support -eq 1 ] && update_trust_ssh
+}
+
+function update_trust_ssh {
+    mkdir -p `dirname ${sshd_conf}`
+    ssh_addrs="${external_ip},${trust_ips// /,}${ddns_ips}"
+    echo "Match User root Address ${ssh_addrs}" > ${sshd_conf}.new
+    echo "    AuthenticationMethods publickey" >> ${sshd_conf}.new
+    if ! cmp -s ${sshd_conf}.new ${sshd_conf}; then
+        cp ${sshd_conf} ${sshd_conf}.bak &> /dev/null
+        mv ${sshd_conf}.new ${sshd_conf}
+        # keep sshd usable even if the generated config fails validation
+        if /usr/sbin/sshd -t; then
+            systemctl reload sshd
+        else
+            [ -f ${sshd_conf}.bak ] && cp ${sshd_conf}.bak ${sshd_conf} || rm -f ${sshd_conf}
+        fi
+    else
+        rm -f ${sshd_conf}.new
+    fi
 }
 
 function clean_ddns_firewall {
@@ -52,6 +78,10 @@ function clean_ddns_firewall {
     /usr/sbin/iptables -t filter -X ddns_firewall_input &> /dev/null
     /usr/sbin/iptables -t filter -F ddns_firewall_forward &> /dev/null
     /usr/sbin/iptables -t filter -X ddns_firewall_forward &> /dev/null
+    if [ $trust_ssh_support -eq 1 ] && [ -f ${sshd_conf} ]; then
+        rm -f ${sshd_conf} ${sshd_conf}.bak ${sshd_conf}.new
+        /usr/sbin/sshd -t && systemctl reload sshd
+    fi
     exit 0
 }
 
